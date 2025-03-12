@@ -1,0 +1,131 @@
+from django.contrib.auth.models import AbstractUser, BaseUserManager
+from django.db import models
+from django.contrib.auth import get_user_model
+from django.contrib.auth.backends import ModelBackend
+
+# Custom User Manager
+class CustomUserManager(BaseUserManager):
+    def create_user(self, email, password=None, role='participant', **extra_fields):
+        if not email:
+            raise ValueError('The Email field must be set')
+        email = self.normalize_email(email)
+        user = self.model(email=email, role=role, **extra_fields)
+        user.set_password(password)
+        user.save(using=self._db)
+        return user
+
+    def create_superuser(self, email, password=None, **extra_fields):
+        extra_fields.setdefault('is_staff', True)
+        extra_fields.setdefault('is_superuser', True)
+        return self.create_user(email, password, role='admin', **extra_fields)
+
+# Custom User Model
+class CustomUser(AbstractUser):
+    ROLE_CHOICES = [
+        ('admin', 'Admin'),
+        ('participant', 'Participant'),
+        ('judge', 'Judge')
+    ]
+    username = None  # Remove default username field
+    email = models.EmailField(unique=True)
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='participant')
+
+    USERNAME_FIELD = 'email'
+    REQUIRED_FIELDS = []
+
+    objects = CustomUserManager()
+
+# Custom authentication backend
+class EmailAuthBackend(ModelBackend):
+    def authenticate(self, request, username=None, password=None, **kwargs):
+        UserModel = get_user_model()
+        try:
+            user = UserModel.objects.get(email=username)
+            if user.check_password(password):
+                return user
+        except UserModel.DoesNotExist:
+            return None
+
+# Views for authentication
+from django.contrib.auth import login, logout, authenticate
+from django.shortcuts import render, redirect
+from django.contrib.auth.decorators import login_required, user_passes_test
+from django.http import HttpResponse
+from .forms import RegistrationForm, LoginForm
+
+# Role-based access control
+
+def is_admin(user):
+    return user.role == 'admin'
+
+def is_participant(user):
+    return user.role == 'participant'
+
+def is_judge(user):
+    return user.role == 'judge'
+
+# Register user
+def register_view(request):
+    if request.method == 'POST':
+        form = RegistrationForm(request.POST)
+        if form.is_valid():
+            form.save()
+            return redirect('login')
+    else:
+        form = RegistrationForm()
+    return render(request, 'register.html', {'form': form})
+
+# Login user
+def login_view(request):
+    if request.method == 'POST':
+        form = LoginForm(request.POST)
+        if form.is_valid():
+            email = form.cleaned_data['email']
+            password = form.cleaned_data['password']
+            user = authenticate(request, username=email, password=password)
+            if user is not None:
+                login(request, user)
+                return redirect('dashboard')
+    else:
+        form = LoginForm()
+    return render(request, 'login.html', {'form': form})
+
+# Logout user
+@login_required
+def logout_view(request):
+    logout(request)
+    return redirect('login')
+
+# Views with access control
+@login_required
+def dashboard(request):
+    return HttpResponse(f'Welcome, {request.user.email}. Your role is {request.user.role}.')
+
+@login_required
+@user_passes_test(is_admin)
+def admin_dashboard(request):
+    return HttpResponse('Admin Dashboard')
+
+@login_required
+@user_passes_test(is_participant)
+def participant_dashboard(request):
+    return HttpResponse('Participant Dashboard')
+
+@login_required
+@user_passes_test(is_judge)
+def judge_dashboard(request):
+    return HttpResponse('Judge Dashboard')
+
+# Forms for authentication
+from django import forms
+from django.contrib.auth.forms import UserCreationForm
+from .models import CustomUser
+
+class RegistrationForm(UserCreationForm):
+    class Meta:
+        model = CustomUser
+        fields = ['email', 'role', 'password1', 'password2']
+
+class LoginForm(forms.Form):
+    email = forms.EmailField()
+    password = forms.CharField(widget=forms.PasswordInput)
