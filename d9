@@ -1,0 +1,189 @@
+import os
+import docker
+import django
+import pytz
+import redis
+from datetime import datetime
+from asgiref.sync import async_to_sync
+from celery import shared_task
+from channels.generic.websocket import WebsocketConsumer
+from django.db import models
+from django.utils.timezone import now
+from django.core.management.base import BaseCommand
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.conf import settings
+from django.urls import path
+
+# Setup Redis for Celery
+REDIS_URL = "redis://localhost:6379/0"
+
+# Ensure timezone support
+TIME_ZONE = 'UTC'
+
+# Django Model for Contests
+class Contest(models.Model):
+    name = models.CharField(max_length=255)
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField()
+    status = models.CharField(max_length=20, default="Scheduled")  # Scheduled, Running, Ended
+
+    def update_status(self):
+        current_time = now().astimezone(pytz.utc)
+        if self.start_time <= current_time < self.end_time:
+            self.status = "Running"
+        elif current_time >= self.end_time:
+            self.status = "Ended"
+        self.save()
+
+# Django Model for Problems
+class Problem(models.Model):
+    contest = models.ForeignKey(Contest, on_delete=models.CASCADE)
+    title = models.CharField(max_length=255)
+    description = models.TextField()
+    sample_input = models.TextField()
+    sample_output = models.TextField()
+
+# Django Model for Submissions
+class Submission(models.Model):
+    user = models.CharField(max_length=255)
+    problem = models.ForeignKey(Problem, on_delete=models.CASCADE)
+    code = models.TextField()
+    language = models.CharField(max_length=20, choices=[("python", "Python"), ("cpp", "C++"), ("java", "Java")])
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    result = models.CharField(max_length=50, default="Pending")  # Pending, Correct, Wrong
+
+# Celery Task: Check Contest Status
+@shared_task
+def check_contests():
+    contests = Contest.objects.all()
+    for contest in contests:
+        contest.update_status()
+
+# WebSocket Consumer for Timer Updates
+class TimerConsumer(WebsocketConsumer):
+    def connect(self):
+        self.accept()
+        async_to_sync(self.send_contest_timer)()
+
+    def send_contest_timer(self):
+        contests = Contest.objects.filter(status="Running")
+        for contest in contests:
+            remaining_time = (contest.end_time - now()).total_seconds()
+            self.send(text_data=f"Contest {contest.name} ends in {int(remaining_time)} seconds")
+
+# Code Execution in Docker Sandbox
+def execute_code(language, code, sample_input):
+    client = docker.from_env()
+    
+    # Language-based execution setup
+    lang_config = {
+        "python": {"image": "python:3.9", "command": "python3 script.py"},
+        "cpp": {"image": "gcc:latest", "command": "g++ script.cpp -o script && ./script"},
+        "java": {"image": "openjdk:latest", "command": "javac Script.java && java Script"}
+    }
+
+    if language not in lang_config:
+        return "Unsupported language"
+
+    # Create temp file for execution
+    filename = {"python": "script.py", "cpp": "script.cpp", "java": "Script.java"}[language]
+    temp_dir = "/tmp/code_execution"
+    os.makedirs(temp_dir, exist_ok=True)
+    with open(os.path.join(temp_dir, filename), "w") as f:
+        f.write(code)
+
+    try:
+        container = client.containers.run(
+            lang_config[language]["image"],
+            command=lang_config[language]["command"],
+            volumes={temp_dir: {'bind': '/usr/src/app', 'mode': 'rw'}},
+            working_dir="/usr/src/app",
+            stdin_open=True,
+            stdout=True,
+            stderr=True,
+            detach=True
+        )
+        result = container.logs().decode("utf-8")
+        container.remove()
+    except Exception as e:
+        result = f"Execution Error: {str(e)}"
+
+    return result.strip()
+
+# API Endpoint: Create Contest
+@csrf_exempt
+def create_contest(request):
+    if request.method == 'POST':
+        import json
+        data = json.loads(request.body)
+
+        name = data.get('name')
+        start_time = datetime.fromisoformat(data.get('start_time'))
+        end_time = datetime.fromisoformat(data.get('end_time'))
+
+        contest = Contest.objects.create(name=name, start_time=start_time, end_time=end_time)
+        return JsonResponse({"message": "Contest created", "contest_id": contest.id})
+
+    return JsonResponse({"error": "Invalid request"}, status=400)
+
+# API Endpoint: Get Contest Status
+def get_contest_status(request, contest_id):
+    contest = Contest.objects.filter(id=contest_id).first()
+    if contest:
+        contest.update_status()
+        return JsonResponse({"contest_id": contest.id, "status": contest.status})
+    return JsonResponse({"error": "Contest not found"}, status=404)
+
+# API Endpoint: Submit Code
+@csrf_exempt
+def submit_code(request):
+    if request.method == 'POST':
+        import json
+        data = json.loads(request.body)
+
+        user = data.get('user')
+        problem_id = data.get('problem_id')
+        code = data.get('code')
+        language = data.get('language')
+
+        problem = Problem.objects.filter(id=problem_id).first()
+        if not problem:
+            return JsonResponse({"error": "Problem not found"}, status=404)
+
+        submission = Submission.objects.create(user=user, problem=problem, code=code, language=language, result="Pending")
+        
+        # Execute code in sandbox
+        execution_result = execute_code(language, code, problem.sample_input)
+        expected_output = problem.sample_output.strip()
+
+        if execution_result == expected_output:
+            submission.result = "Correct"
+        else:
+            submission.result = "Wrong"
+        submission.save()
+
+        return JsonResponse({"message": "Submission received", "submission_id": submission.id, "result": submission.result})
+
+    return JsonResponse({"error": "Invalid request"}, status=400)
+
+# URL Patterns
+urlpatterns = [
+    path('create_contest/', create_contest, name="create_contest"),
+    path('status/<int:contest_id>/', get_contest_status, name="get_contest_status"),
+    path('submit/', submit_code, name="submit_code"),
+]
+
+# Django Celery Command to Schedule Tasks
+class Command(BaseCommand):
+    def handle(self, *args, **options):
+        from celery import Celery
+        app = Celery('coding_contest', broker=REDIS_URL)
+        app.conf.beat_schedule = {
+            'check-contests-every-minute': {
+                'task': 'check_contests',
+                'schedule': 60.0,  # Run every 60 seconds
+            },
+        }
+        app.conf.timezone = TIME_ZONE
+        app.start()
