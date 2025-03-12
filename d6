@@ -1,0 +1,85 @@
+import os
+import django
+import pytz
+import redis
+from datetime import datetime
+from celery import shared_task
+from django.db import models
+from django.utils.timezone import now
+from django.core.management.base import BaseCommand
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.conf import settings
+from django.urls import path
+
+# Setup Redis for Celery
+REDIS_URL = "redis://localhost:6379/0"
+
+# Ensure timezone support
+TIME_ZONE = 'UTC'
+
+# Django Model for Contest
+class Contest(models.Model):
+    name = models.CharField(max_length=255)
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField()
+    status = models.CharField(max_length=20, default="Scheduled")  # Scheduled, Running, Ended
+
+    def update_status(self):
+        current_time = now().astimezone(pytz.utc)
+        if self.start_time <= current_time < self.end_time:
+            self.status = "Running"
+        elif current_time >= self.end_time:
+            self.status = "Ended"
+        self.save()
+
+# Celery Task: Check Contest Status
+@shared_task
+def check_contests():
+    contests = Contest.objects.all()
+    for contest in contests:
+        contest.update_status()
+
+# API Endpoint: Create Contest
+@csrf_exempt
+def create_contest(request):
+    if request.method == 'POST':
+        import json
+        data = json.loads(request.body)
+
+        name = data.get('name')
+        start_time = datetime.fromisoformat(data.get('start_time'))
+        end_time = datetime.fromisoformat(data.get('end_time'))
+
+        contest = Contest.objects.create(name=name, start_time=start_time, end_time=end_time)
+        return JsonResponse({"message": "Contest created", "contest_id": contest.id})
+
+    return JsonResponse({"error": "Invalid request"}, status=400)
+
+# API Endpoint: Get Contest Status
+def get_contest_status(request, contest_id):
+    contest = Contest.objects.filter(id=contest_id).first()
+    if contest:
+        contest.update_status()
+        return JsonResponse({"contest_id": contest.id, "status": contest.status})
+    return JsonResponse({"error": "Contest not found"}, status=404)
+
+# URL Patterns
+urlpatterns = [
+    path('create/', create_contest, name="create_contest"),
+    path('status/<int:contest_id>/', get_contest_status, name="get_contest_status"),
+]
+
+# Django Celery Command to Schedule Tasks
+class Command(BaseCommand):
+    def handle(self, *args, **options):
+        from celery import Celery
+        app = Celery('contest_scheduler', broker=REDIS_URL)
+        app.conf.beat_schedule = {
+            'check-contests-every-minute': {
+                'task': 'check_contests',
+                'schedule': 60.0,  # Run every 60 seconds
+            },
+        }
+        app.conf.timezone = TIME_ZONE
+        app.start()
