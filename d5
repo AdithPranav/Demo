@@ -1,0 +1,84 @@
+import os
+import requests
+import Levenshtein
+from django.db import models
+from django.shortcuts import get_object_or_404
+from django.core.files.storage import default_storage
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.conf import settings
+from django.urls import path
+from django.core.files.base import ContentFile
+
+# Ensure media folder exists
+MEDIA_ROOT = os.path.join(settings.BASE_DIR, 'media')
+os.makedirs(MEDIA_ROOT, exist_ok=True)
+
+# Django Model for Code Submissions
+class CodeSubmission(models.Model):
+    code_file = models.FileField(upload_to="uploads/")
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    def get_code_content(self):
+        with self.code_file.open('r') as file:
+            return file.read()
+
+# Function to check Levenshtein similarity
+def calculate_similarity(code1, code2):
+    return Levenshtein.ratio(code1, code2) * 100  # Percentage similarity
+
+# Function to integrate Moss for plagiarism detection
+def check_plagiarism_moss():
+    moss_user_id = "YOUR_MOSS_USER_ID"  # Replace with your MOSS ID
+    files = CodeSubmission.objects.all()
+    
+    if len(files) < 2:
+        return "Not enough submissions for comparison."
+
+    # Uploading files to MOSS
+    url = "https://theory.stanford.edu/~aiken/moss/"
+    data = {"userid": moss_user_id, "lang": "python"}
+    files_payload = [("file", (f.code_file.name, f.code_file.read())) for f in files]
+
+    response = requests.post(url, data=data, files=files_payload)
+    
+    if response.status_code == 200:
+        return response.text.strip()
+    else:
+        return "Error communicating with MOSS."
+
+# API Endpoint: Upload Code
+@csrf_exempt
+def upload_code(request):
+    if request.method == 'POST' and request.FILES.get('code_file'):
+        file = request.FILES['code_file']
+        saved_file = default_storage.save(f"uploads/{file.name}", ContentFile(file.read()))
+        submission = CodeSubmission(code_file=saved_file)
+        submission.save()
+        return JsonResponse({"message": "File uploaded successfully!", "submission_id": submission.id})
+    return JsonResponse({"error": "Invalid request"}, status=400)
+
+# API Endpoint: Check Plagiarism
+@csrf_exempt
+def check_plagiarism(request, submission_id):
+    submission = get_object_or_404(CodeSubmission, id=submission_id)
+    all_submissions = CodeSubmission.objects.exclude(id=submission_id)
+
+    results = []
+    for other_submission in all_submissions:
+        similarity = calculate_similarity(submission.get_code_content(), other_submission.get_code_content())
+        results.append({"compared_with": other_submission.id, "similarity": f"{similarity:.2f}%"})
+
+    moss_result = check_plagiarism_moss()
+
+    return JsonResponse({"levenshtein_results": results, "moss_result": moss_result})
+
+# URL Patterns
+urlpatterns = [
+    path('upload/', upload_code, name="upload_code"),
+    path('check/<int:submission_id>/', check_plagiarism, name="check_plagiarism"),
+]
+
+# Django Settings Update (Add these in settings.py)
+settings.MEDIA_URL = '/media/'
+settings.MEDIA_ROOT = MEDIA_ROOT
