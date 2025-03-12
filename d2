@@ -1,0 +1,115 @@
+from django.db import models
+from django.contrib.auth import get_user_model
+from django.contrib.auth.decorators import login_required
+from django.shortcuts import render, redirect, get_object_or_404
+from django.http import JsonResponse
+import subprocess
+import tempfile
+import json
+import os
+
+User = get_user_model()
+
+# Models
+class Problem(models.Model):
+    title = models.CharField(max_length=255)
+    description = models.TextField()
+    input_test_cases = models.TextField()  # JSON format
+    expected_outputs = models.TextField()  # JSON format
+
+class Submission(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    problem = models.ForeignKey(Problem, on_delete=models.CASCADE)
+    code = models.TextField()
+    language = models.CharField(max_length=10, choices=[('python', 'Python'), ('cpp', 'C++'), ('java', 'Java')])
+    result = models.CharField(max_length=50, null=True, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+# Views
+@login_required
+def submit_code(request, problem_id):
+    if request.method == 'POST':
+        problem = get_object_or_404(Problem, id=problem_id)
+        code = request.POST.get('code')
+        language = request.POST.get('language')
+
+        # Run test case evaluation
+        result = evaluate_code(code, problem.input_test_cases, problem.expected_outputs, language)
+
+        submission = Submission.objects.create(
+            user=request.user,
+            problem=problem,
+            code=code,
+            language=language,
+            result=result
+        )
+        return JsonResponse({'result': result})
+    return JsonResponse({'error': 'Invalid request'}, status=400)
+
+# Code Evaluation Function
+def evaluate_code(code, input_cases, expected_outputs, language):
+    input_cases = json.loads(input_cases)
+    expected_outputs = json.loads(expected_outputs)
+    
+    if language == 'python':
+        ext = '.py'
+        run_cmd = ['python3']
+    elif language == 'cpp':
+        ext = '.cpp'
+        compile_cmd = ['g++', '-o', 'temp_exec']
+        run_cmd = ['./temp_exec']
+    elif language == 'java':
+        ext = '.java'
+        compile_cmd = ['javac']
+        run_cmd = ['java', 'TempFile']
+    else:
+        return 'Unsupported Language'
+    
+    with tempfile.NamedTemporaryFile(mode='w+', suffix=ext, delete=False) as temp_file:
+        temp_file.write(code)
+        temp_file.flush()
+        temp_filename = temp_file.name
+        temp_basename = os.path.basename(temp_filename)
+    
+    if language in ['cpp', 'java']:
+        compile_process = subprocess.run(compile_cmd + [temp_filename], capture_output=True, text=True)
+        if compile_process.returncode != 0:
+            return f'Compilation Error: {compile_process.stderr}'
+    
+    results = []
+    for i, input_case in enumerate(input_cases):
+        try:
+            if language == 'cpp':
+                execution_cmd = run_cmd
+            elif language == 'java':
+                execution_cmd = ['java', temp_basename.replace('.java', '')]
+            else:
+                execution_cmd = ['python3', temp_filename]
+            
+            process = subprocess.run(
+                execution_cmd, input=input_case, text=True, capture_output=True, timeout=5
+            )
+            output = process.stdout.strip()
+            expected = expected_outputs[i].strip()
+            if output == expected:
+                results.append('Pass')
+            else:
+                results.append('Fail')
+        except Exception as e:
+            results.append(f'Error: {str(e)}')
+    
+    os.remove(temp_filename)
+    if language == 'cpp':
+        os.remove('temp_exec')
+    elif language == 'java':
+        os.remove(temp_basename.replace('.java', '.class'))
+    
+    return 'All Passed' if all(res == 'Pass' for res in results) else 'Some Failed'
+
+# Leaderboard
+@login_required
+def leaderboard(request):
+    scores = Submission.objects.values('user__email').annotate(score=models.Count('id')).order_by('-score')
+    return JsonResponse({'leaderboard': list(scores)})
+
+# Templates and Forms can be added as needed for UI rendering
