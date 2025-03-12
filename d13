@@ -1,0 +1,162 @@
+from django.db import models
+from django.contrib.auth import get_user_model
+from django.contrib.auth.decorators import login_required
+from django.shortcuts import render, redirect, get_object_or_404
+from django.http import JsonResponse
+from django.db.models import Count, Avg
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
+from django.contrib import admin
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+import subprocess
+import tempfile
+import json
+import os
+import resource
+import random
+
+User = get_user_model()
+
+# Models
+class Problem(models.Model):
+    title = models.CharField(max_length=255)
+    description = models.TextField()
+    input_test_cases = models.TextField()  # JSON format
+    expected_outputs = models.TextField()  # JSON format
+    difficulty = models.IntegerField(default=1500)  # Default rating
+
+class Submission(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    problem = models.ForeignKey(Problem, on_delete=models.CASCADE)
+    code = models.TextField()
+    language = models.CharField(max_length=10, choices=[('python', 'Python'), ('cpp', 'C++'), ('java', 'Java')])
+    result = models.CharField(max_length=50, null=True, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    success = models.BooleanField(default=False)
+
+class UserRating(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE)
+    rating = models.IntegerField(default=1500)
+
+class Contest(models.Model):
+    name = models.CharField(max_length=255)
+    description = models.TextField()
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField()
+    problems = models.ManyToManyField(Problem)
+    participants = models.ManyToManyField(User, blank=True)
+
+# Automated Test Case Generator
+def generate_test_cases(problem_id, num_cases=5):
+    problem = get_object_or_404(Problem, id=problem_id)
+    test_cases = []
+    expected_outputs = []
+    
+    for _ in range(num_cases):
+        input_case = [random.randint(1, 100) for _ in range(3)]
+        output = sum(input_case)
+        test_cases.append(input_case)
+        expected_outputs.append(output)
+    
+    problem.input_test_cases = json.dumps(test_cases)
+    problem.expected_outputs = json.dumps(expected_outputs)
+    problem.save()
+    
+    return {'test_cases': test_cases, 'expected_outputs': expected_outputs}
+
+# Admin Panel
+@admin.register(Problem)
+class ProblemAdmin(admin.ModelAdmin):
+    list_display = ('title', 'difficulty')
+    search_fields = ('title',)
+    actions = ['generate_test_cases_action']
+    
+    def generate_test_cases_action(self, request, queryset):
+        for problem in queryset:
+            generate_test_cases(problem.id)
+        self.message_user(request, "Test cases generated successfully.")
+
+@admin.register(Submission)
+class SubmissionAdmin(admin.ModelAdmin):
+    list_display = ('user', 'problem', 'language', 'result', 'timestamp')
+    list_filter = ('language', 'success')
+
+@admin.register(UserRating)
+class UserRatingAdmin(admin.ModelAdmin):
+    list_display = ('user', 'rating')
+
+@admin.register(Contest)
+class ContestAdmin(admin.ModelAdmin):
+    list_display = ('name', 'start_time', 'end_time')
+    search_fields = ('name',)
+    filter_horizontal = ('problems', 'participants')
+
+# API for external code evaluation
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def evaluate_code_api(request):
+    data = request.data
+    code = data.get('code')
+    language = data.get('language')
+    input_cases = data.get('input_cases')
+    expected_outputs = data.get('expected_outputs')
+    
+    if not code or not language or not input_cases or not expected_outputs:
+        return Response({'error': 'Missing required fields'}, status=400)
+    
+    result = evaluate_code_sandboxed(code, json.dumps(input_cases), json.dumps(expected_outputs), language)
+    return Response({'result': result})
+
+# Views
+@login_required
+def submit_code(request, problem_id):
+    if request.method == 'POST':
+        problem = get_object_or_404(Problem, id=problem_id)
+        code = request.POST.get('code')
+        language = request.POST.get('language')
+        
+        result = evaluate_code_sandboxed(code, problem.input_test_cases, problem.expected_outputs, language)
+        success = (result == 'All Passed')
+        
+        submission = Submission.objects.create(
+            user=request.user,
+            problem=problem,
+            code=code,
+            language=language,
+            result=result,
+            success=success
+        )
+        
+        if success:
+            update_user_rating(request.user, problem)
+        
+        update_leaderboard()
+        
+        return JsonResponse({'result': result})
+    return JsonResponse({'error': 'Invalid request'}, status=400)
+
+# Rating System (Elo-based)
+def update_user_rating(user, problem):
+    user_rating, _ = UserRating.objects.get_or_create(user=user)
+    k_factor = 32
+    expected_score = 1 / (1 + 10 ** ((problem.difficulty - user_rating.rating) / 400))
+    actual_score = 1
+    new_rating = user_rating.rating + k_factor * (actual_score - expected_score)
+    user_rating.rating = int(new_rating)
+    user_rating.save()
+
+# Real-time Leaderboard
+@login_required
+def leaderboard(request):
+    scores = UserRating.objects.values('user__email', 'rating').order_by('-rating')
+    return JsonResponse({'leaderboard': list(scores)})
+
+def update_leaderboard():
+    scores = list(UserRating.objects.values('user__email', 'rating').order_by('-rating'))
+    channel_layer = get_channel_layer()
+    async_to_sync(channel_layer.group_send)(
+        'leaderboard_group',
+        {'type': 'update_leaderboard', 'leaderboard': scores}
+    )
